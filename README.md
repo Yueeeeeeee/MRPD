@@ -1,9 +1,9 @@
 # MRPD: Multi-Expert Replay Policy Distillation
 
-[![Paper](https://img.shields.io/badge/Paper-arXiv:2611.24059-b31b1b.svg)](https://arxiv.org/pdf/2611.24059)
+[![Paper](https://img.shields.io/badge/Paper-arXiv:2611.24059-b31b1b.svg)](https://arxiv.org/abs/2611.24059)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-This repository contains the code for [**Replay, Don't Resample: Off-Policy Consolidation of Long-Horizon RL Experts**](https://arxiv.org/pdf/2611.24059).
+This repository contains the code for [**Replay, Don't Resample: Off-Policy Consolidation of Long-Horizon RL Experts**](https://arxiv.org/abs/2611.24059).
 
 <img src=assets/intro.png width=1000>
 
@@ -25,7 +25,7 @@ with a retriever, text-to-SQL), as domain averages over sixteen held-out sets:
 eight GPUs. On eight H100s, a step of MRPD takes about 110 s against 350 s for MOPD: **3× faster per
 step while training on 2.7× the samples** (1536 against 576). The 300 steps finish in about **9 hours**,
 where MOPD needs about 29. Matched to MOPD's 576 samples per step, MRPD consolidates the three experts
-in about **3 hours**, roughly **10× faster** than MOPD.
+in about **3.7 hours**, roughly **8× faster** than MOPD.
 
 ## Repository layout
 
@@ -601,6 +601,17 @@ python3 tests/collect_pass_at_k_test.py       # scripts/eval/collect_pass_at_k.p
 - A Megatron checkout elsewhere than `/root/Megatron-LM`: `export MEGATRON_ROOT=/path/to/Megatron-LM`.
 - The launchers assume a node with eight GPUs. Online runs split it into 2 for the trainer and 6 for
   the rollout engines; the replay gives all eight to the trainer.
+
+## Citation
+
+```bibtex
+@article{yue2026replay,
+  title={Replay, Don't Resample: Off-Policy Consolidation of Long-Horizon RL Experts},
+  author={Yue, Zhenrui and Chen, Gongxiaohui and Zeng, Huimin and Zhuang, Honglei and Sun, Jiashuo and Han, Zhen and Wang, Dong},
+  journal={arXiv preprint arXiv:2611.24059},
+  year={2026}
+}
+```
 
 ## Acknowledgments
 

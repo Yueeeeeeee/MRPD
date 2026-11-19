@@ -6,7 +6,7 @@ for step k, unpickles 1536 samples' token and log-prob lists and builds the
 Sample objects, then converts and splits them for the trainer. The manager has
 nothing else to do in a replay (no engine to drive), and the trainer waits for
 it at every step: about 6 s of a 179 s step (perf/train_wait_time on the
-MOPeD run, 2026-11-07).
+MRPD run, 2026-11-07).
 
 So the manager starts reading step k + 1 in a thread as soon as it has handed
 out step k; the read overlaps the training of step k, and the next generate()

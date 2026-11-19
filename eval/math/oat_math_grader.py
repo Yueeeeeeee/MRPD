@@ -413,7 +413,7 @@ REMOVED_EXPRESSIONS = [
 def normalize_final_answer(final_answer: str) -> str:
     """
     Normalize a final answer to a quantitative reasoning question.
-    This code comes from https://arxiv.org/pdf/2206.14858.pdf, page18.
+    This code comes from https://arxiv.org/abs/2206.14858, page 18.
     """
     # final_answer = final_answer.split("=")[-1]
 
