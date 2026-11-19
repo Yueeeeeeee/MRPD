@@ -1,23 +1,13 @@
 # MRPD: Multi-Expert Replay Policy Distillation
 
-Code for **"Replay, Don't Resample: Off-Policy Consolidation of Long-Horizon RL Experts"**.
+[![Paper](https://img.shields.io/badge/Paper-arXiv:2611.24059-b31b1b.svg)](https://arxiv.org/pdf/2611.24059)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-Frontier post-training trains one RL expert per domain and then consolidates the experts into one
-model, usually by multi-teacher on-policy distillation (MOPD): the student samples in every
-environment again and each expert scores its tokens. MRPD consolidates the experts **without sampling
-anything**. Every RL step of an expert already produced a batch of rollouts with their rewards and
-sampling log-probabilities. MRPD replays these training logs through the student, in the order the
-experts learned from them, with two per-token terms:
+This repository contains the code for [**Replay, Don't Resample: Off-Policy Consolidation of Long-Horizon RL Experts**](https://arxiv.org/pdf/2611.24059).
 
-- **Policy gradient (PG).** GRPO's clipped surrogate, recomputed on the logged trajectories and rewards,
-  with the importance ratio taken to the logged sampling policy.
-- **Distillation (KL).** The KL between the student's and the final expert's next-token distributions at
-  every logged prefix, computed in closed form over the expert's top-k tokens and a tail atom, with no
-  ratio and no clip.
+<img src=assets/intro.png width=1000>
 
-The trainer is the only process: no environment, no tool call, no rollout engine. Following the experts'
-order keeps the student close to the policies that sampled the logs, so the replay is off-policy in
-origin but stays within the clip range throughout.
+Frontier post-training follows a common recipe: train one expert per domain with reinforcement learning (RL), then consolidate the experts into one model via multi-teacher on-policy distillation (MOPD). Such consolidation is expensive: the student samples in every environment again, an expert scores every sampled token, and the student inherits the drift of the final experts. Yet we argue that the experts' RL runs have already produced what consolidation needs: rollouts with their sampling probabilities and rewards, in the order the experts learned from them. We propose multi-expert replay policy distillation (MRPD), which replays these training logs through the student in the experts' order. At each step, the policy gradient is recomputed on these scored trajectories, and the final experts' distributions are distilled at the logged prefixes. Following the experts' own trajectory reduces the training-inference mismatch and keeps the student within the clip range, so the replay is off-policy in origin but quasi-on-policy throughout consolidation. MRPD samples nothing and calls no environment or reward model: the trainer is the sole process, and consolidating the experts costs only about a seventh of the compute used to train them. On three long-horizon agentic domains (reasoning, search and SQL), MRPD yields the best student model, substantially outperforming online RL baselines, and surpassing MOPD from the same experts at a fraction of MOPD's cost. Our analysis on the same logs shows that the replayed trajectories carry most of the gain, and that both the policy gradient and the distillation term add to it. Most interestingly, the order of the logs matters more than their amount or rewards, suggesting that expert training logs are a curriculum, not a data mixture.
 
 Results after 300 steps with Qwen3-4B on three agentic domains (reasoning with a Python sandbox, search
 with a retriever, text-to-SQL), as domain averages over sixteen held-out sets:
@@ -31,7 +21,11 @@ with a retriever, text-to-SQL), as domain averages over sixteen held-out sets:
 | **MRPD** | 63.7 | 42.0 | 70.1 | **58.6** |
 | Single-domain GRPO experts (each on its own domain) | 65.2 | 43.0 | 69.6 | 59.3 |
 
-On eight H100s a step of MRPD takes about 110 s against 350 s for MOPD, and the 300 steps take 9 hours.
+**Consolidation is cheap.** MRPD samples nothing and calls no environment, so the trainer gets all
+eight GPUs. On eight H100s, a step of MRPD takes about 110 s against 350 s for MOPD: **3× faster per
+step while training on 2.7× the samples** (1536 against 576). The 300 steps finish in about **9 hours**,
+where MOPD needs about 29. Matched to MOPD's 576 samples per step, MRPD consolidates the three experts
+in about **3 hours**, roughly **10× faster** than MOPD.
 
 ## Repository layout
 
