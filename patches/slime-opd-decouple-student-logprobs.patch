@@ -1,0 +1,58 @@
+opd: take the OPD KL's student log-probs from the trainer, not from the ratio.
+
+--use-rollout-logprobs selects one tensor that is then used for two unrelated
+jobs (loss.py): the denominator of the importance ratio, and the student side of
+the OPD reverse KL, which *is* the advantage.
+
+Those want different tensors. Importance sampling gives
+
+    KL(pi || pi_T) = E_{y~mu}[ (pi(y)/mu(y)) * (log pi(y) - log pi_T(y)) ]
+
+so the ratio's denominator should be mu -- the policy that sampled the tokens,
+i.e. the rollout engine's log-probs -- while the quantity it weights should come
+from the current policy. With --opd-type megatron the teacher side is always a
+Megatron forward, so taking the student side from SGLang puts cross-engine
+kernel disagreement straight into the advantage; taking both from the same
+forward cancels it. Turning --use-rollout-logprobs off instead fixes the KL but
+silently drops the off-policy correction the async loop needs.
+
+Two one-line changes:
+
+  loss.py   the OPD call reads rollout_data["log_probs"] (the trainer's own
+            forward) and falls back to the ratio's tensor when absent.
+  actor.py  that forward is also run when --use-rollout-logprobs is set, if OPD
+            is on. can_reuse_log_probs_in_loss is already hard-false whenever
+            use_opd is set, so this cannot make it run twice.
+
+Both are gated on args.use_opd, so runs without OPD are unaffected.
+
+diff --git a/slime/backends/megatron_utils/actor.py b/slime/backends/megatron_utils/actor.py
+index 9bd65336..db0639e1 100644
+--- a/slime/backends/megatron_utils/actor.py
++++ b/slime/backends/megatron_utils/actor.py
+@@ -465,7 +465,7 @@ class MegatronTrainRayActor(TrainRayActor):
+                     and self.args.advantage_estimator != "gspo"
+                 )
+                 if (
+-                    not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics
++                    not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics or self.args.use_opd
+                 ) and not can_reuse_log_probs_in_loss:
+                     if self.args.use_routing_replay:
+                         if self.args.use_rollout_routing_replay:
+diff --git a/slime/backends/megatron_utils/loss.py b/slime/backends/megatron_utils/loss.py
+index adfa5d67..4158130b 100644
+--- a/slime/backends/megatron_utils/loss.py
++++ b/slime/backends/megatron_utils/loss.py
+@@ -769,7 +769,11 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch)
+             args=args,
+             rollout_data=rollout_data,
+             advantages=advantages,
+-            student_log_probs=log_probs,
++            # Not `log_probs`: that may be the rollout engine's, which is what the
++            # importance ratio wants, while this KL must be measured against the
++            # same engine as the teacher. Falls back when the trainer's own
++            # log-probs were not computed.
++            student_log_probs=rollout_data.get("log_probs", log_probs),
+         )
+ 
+     # TODO: OpenRLHF always does advantages normalization but veRL doesn't seem to do it.

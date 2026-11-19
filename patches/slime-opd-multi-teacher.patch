@@ -1,0 +1,484 @@
+opd: one teacher per sample source, so a cross-domain run distils the way a
+single-domain one does.
+
+--opd-type megatron loads ONE teacher (--opd-teacher-load) and forwards it over
+the whole batch. A cross-domain run has two domains with two separate teachers,
+which left only --opd-type sglang: serve both teachers over HTTP and have the
+rollout fetch their log-probs. That arrangement differs from the single-domain
+arms in two ways that both change the measured quantity, not just the cost.
+
+  1. A served teacher can fail to answer. It did: the first opd_both run lost
+     samples to ServerDisconnectedError on pooled connections. A resident
+     teacher cannot fail to answer -- the forward runs or the process dies.
+
+  2. The OPD KL is student_logp - teacher_logp. With a served teacher the
+     student side comes from the rollout engine's incremental decode and the
+     teacher side from a separate server's one-shot prefill. Those are two
+     numerical paths for the same tokens, and any systematic difference between
+     them lands directly in the advantage, uniformly signed. With a resident
+     teacher both sides come from the same Megatron forward (that is what
+     slime-opd-decouple-student-logprobs arranges) and the difference cancels.
+
+So: allow a teacher per sample source.
+
+  --opd-teacher-loads retool=/ckpt/math,search-r1=/ckpt/search
+  --opd-teacher-ckpt-steps retool=499,search-r1=499
+
+Either flag also takes JSON. The pair form exists because the JSON form has to
+survive Ray's entrypoint, which joins the whole command into one string: a run
+reached argparse with the outer single quotes still attached, and json.loads
+rejects that at character 0 with a message that mentions neither quoting nor
+the flag's real problem. The pair form has no quotes, braces or spaces in it,
+so there is nothing for a join to get wrong. Both spellings strip surrounding
+quotes before parsing, so the wrapped case is read rather than rejected.
+
+Each entry is loaded under its own weight tag, "teacher::<source>". The backuper
+holds weight sets in pinned host memory, so N teachers cost N x model-size of
+host RAM and nothing on the GPU; switching between them is a host-to-device copy
+of the model, ~0.3s for a 4B, against a step measured in tens of seconds.
+
+Each teacher is forwarded over its own source's samples alone (_forward_teachers,
+since 2026-11-07): the rank's samples of that source, in the batch's order,
+packed into micro-batches the way build_dp_schedule packs a step (first fit
+under --max-tokens-per-gpu), through the same compute_log_prob; the outputs are
+scattered back to the batch's index space, None at the other sources'
+positions, and the per-sample choice by Sample.metadata['source_name'] is then
+the per-index choice it always was, refusing a None. Until then every teacher
+forwarded the whole batch and the other sources' rows were discarded -- with
+three teachers, two thirds of the teacher forwards (77 s of the replay arms'
+179 s step) -- the deliberate trade for output lists that could not misalign.
+The misalignment a per-source schedule could hide (a sample trained against
+another domain's teacher, invisible in the loss) is what the None guard and
+tests/teacher_forward_patch_test.py are for.
+
+A teacher whose source is absent from a rank's partition is skipped, so a
+single-source run pays nothing. --opd-teacher-load is untouched and still takes
+the "teacher" tag, so existing runs and their checkpoints are unaffected.
+
+A source with no teacher raises rather than defaulting to one: silently
+distilling a domain against the wrong teacher is the failure this exists to
+prevent.
+
+diff --git a/slime/backends/megatron_utils/actor.py b/slime/backends/megatron_utils/actor.py
+index 55b0b27..e1ea98a 100644
+--- a/slime/backends/megatron_utils/actor.py
++++ b/slime/backends/megatron_utils/actor.py
+@@ -48,6 +48,104 @@ logging.getLogger("megatron").setLevel(logging.WARNING)
+ logger = logging.getLogger(__name__)
+ 
+ 
++# slime-opd-multi-teacher: one teacher weight set per sample source.
++def _teacher_source(teacher_tag: str) -> str:
++    """"teacher::retool" -> "retool". Only valid for the per-source tags."""
++    return teacher_tag.split("::", 1)[1]
++
++
++def _teachers_present_in_batch(teacher_tags: list[str], rollout_data: RolloutBatch) -> list[str]:
++    """Drop teachers that have no sample to score on this rank.
++
++    With one teacher (--opd-teacher-load) there is nothing to decide. With
++    --opd-teacher-loads, a rank whose partition happens to hold a single source
++    -- which is what a run with one source, or a source-ordered batch, produces
++    -- should not pay for the other teachers' forwards.
++    """
++    if teacher_tags == ["teacher"] or not teacher_tags:
++        return teacher_tags
++    source_names = rollout_data.get("source_names")
++    if source_names is None:
++        raise ValueError(
++            "--opd-teacher-loads routes each sample to its own teacher by source, but this "
++            "rollout carries no 'source_names'. The rollout must set "
++            "Sample.metadata['source_name'] on every sample (see slime.utils.data.get_source)."
++        )
++    present = set(source_names)
++    return [tag for tag in teacher_tags if _teacher_source(tag) in present]
++
++
++def _source_forward_schedule(source_names, total_lengths, source, max_tokens_per_mbs, micro_batch_size):
++    """One teacher's forward: its source's samples (indices into the rank's batch, in the batch's order)
++    and their micro-batches (lists of positions in that index list, each position in exactly one),
++    packed as build_dp_schedule packs a step (slime/utils/dp_schedule.py): first fit under the token
++    cap with the dynamic batch size, an oversized sample alone; fixed chunks of micro_batch_size
++    otherwise. Deterministic, so the tensor-parallel ranks of a data-parallel rank agree."""
++    from slime.utils.seqlen_balancing import first_fit_pack
++
++    indices = [i for i, name in enumerate(source_names) if name == source]
++    if max_tokens_per_mbs is not None:
++        micro_batches = first_fit_pack([total_lengths[i] for i in indices], max_tokens_per_mbs)
++    else:
++        micro_batches = [
++            list(range(a, min(a + micro_batch_size, len(indices)))) for a in range(0, len(indices), micro_batch_size)
++        ]
++    assert sorted(j for mbs in micro_batches for j in mbs) == list(range(len(indices))), "every sample once"
++    return indices, micro_batches
++
++
++def _scatter_rows(values, indices, n):
++    """values[j], computed for the sample at indices[j], back at that index of a list of n; None elsewhere."""
++    assert len(values) == len(indices), (len(values), len(indices))
++    out = [None] * n
++    for j, i in enumerate(indices):
++        out[i] = values[j]
++    return out
++
++
++def _route_teacher_log_probs(rollout_data: RolloutBatch, teacher_tags: list[str]) -> None:
++    """Pick each sample's own teacher's log-probs into rollout_data["teacher_log_probs"].
++
++    Every "{tag}_log_probs" list is index-aligned with rollout_data: a teacher's forward over its
++    own source's samples is scattered back to the batch's indices, None at the other sources'
++    (_forward_teachers), so this is a per-index choice and never a reordering. A None at a
++    sample's own teacher is refused: that sample was not scored by it.
++    """
++    keys = {tag: f"{tag}_log_probs" for tag in teacher_tags}
++    if not all(key in rollout_data for key in keys.values()):
++        # Not the last pipeline stage: there are no log-probs here, and
++        # compute_advantages_and_returns returns before it would want them.
++        return
++
++    source_names = rollout_data["source_names"]
++    by_source = {_teacher_source(tag): rollout_data[key] for tag, key in keys.items()}
++    routed = []
++    for index, source in enumerate(source_names):
++        if source not in by_source:
++            raise ValueError(
++                f"Sample {index} has source {source!r}, which has no teacher in "
++                f"--opd-teacher-loads (teachers: {sorted(by_source)}). Every source in the "
++                "rollout needs one, otherwise that sample has no distillation target."
++            )
++        value = by_source[source][index]
++        if value is None:
++            raise ValueError(
++                f"Sample {index} (source {source!r}) was not scored by its teacher: the per-source "
++                "forward schedule (_source_forward_schedule) and the batch disagree."
++            )
++        routed.append(value)
++    rollout_data["teacher_log_probs"] = routed
++
++    # The per-teacher lists are what each teacher thought of EVERY sample,
++    # including the ones it is not the teacher for. Keeping them would put
++    # meaningless cross-domain log-probs into the rollout metrics, which log
++    # every list-of-tensor key they find. Drop everything the teacher forwards
++    # stored, not just log_probs, so an added output (entropy) cannot leak.
++    for tag in teacher_tags:
++        for key in [k for k in list(rollout_data) if k.startswith(f"{tag}_")]:
++            del rollout_data[key]
++
++
+ class MegatronTrainRayActor(TrainRayActor):
+     @with_defer(lambda: Timer().start("train_wait"))
+     def init(
+@@ -125,9 +223,14 @@ class MegatronTrainRayActor(TrainRayActor):
+         if with_ref:
+             self.load_other_checkpoint("ref", args.ref_load)
+ 
+-        # Load teacher model for Megatron-based on-policy distillation
++        # Load teacher model(s) for Megatron-based on-policy distillation.
++        # One tag per teacher: "teacher" for --opd-teacher-load, or
++        # "teacher::<source>" per entry of --opd-teacher-loads. Each is a full
++        # weight set held in pinned host memory by the backuper, so N teachers
++        # cost N x model-size of host RAM and nothing on the GPU.
+         if with_opd_teacher:
+-            self.load_other_checkpoint("teacher", args.opd_teacher_load)
++            for teacher_tag, teacher_path in args.opd_teacher_load_map.items():
++                self.load_other_checkpoint(teacher_tag, teacher_path)
+ 
+         if self.args.keep_old_actor:
+             # Load old_actor checkpoint
+@@ -369,6 +472,72 @@ class MegatronTrainRayActor(TrainRayActor):
+                 use_rollout_top_p_replay=True,
+             )
+ 
++    # The per-sample keys forward_only's get_batch reads (model.py: tokens, loss masks, lengths,
++    # multimodal inputs, the rollout top-p replay's token sets); a teacher's view of the batch
++    # carries these alone.
++    _FORWARD_KEYS = (
++        "tokens",
++        "loss_masks",
++        "multimodal_train_inputs",
++        "total_lengths",
++        "response_lengths",
++        "rollout_top_p_token_ids",
++        "rollout_top_p_token_offsets",
++    )
++
++    def _forward_teachers(
++        self, rollout_data: RolloutBatch, data_iterator: list[DataIterator], num_microbatches: list[int]
++    ) -> None:
++        """Forward the teacher model(s) for teacher_log_probs (Megatron-based OPD).
++
++        With one teacher (--opd-teacher-load) this is the original single forward over the
++        batch's data iterator. With --opd-teacher-loads each teacher is forwarded over its own
++        source's samples alone, on a micro-batch schedule packed for them
++        (_source_forward_schedule), and its outputs are scattered back to the batch's index
++        space, None at the other sources' positions; _route_teacher_log_probs then makes its
++        per-index choice as before and refuses a None, so a sample its teacher did not score
++        cannot be trained on silently. Until 2026-11-07 every teacher forwarded the whole batch
++        and the other sources' rows were discarded: two thirds of the teacher forwards with
++        three teachers.
++        """
++        teacher_tags = [
++            tag for tag in self.weights_backuper.backup_tags if tag == "teacher" or tag.startswith("teacher::")
++        ]
++        teacher_tags = _teachers_present_in_batch(teacher_tags, rollout_data)
++        if not teacher_tags:
++            return
++        if self.args.use_routing_replay:
++            os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
++        if teacher_tags == ["teacher"]:
++            self._switch_model("teacher")
++            rollout_data.update(self.compute_log_prob(data_iterator, num_microbatches, store_prefix="teacher_"))
++            return
++        source_names = rollout_data["source_names"]
++        max_tokens = (
++            self.args.max_tokens_per_gpu * mpu.get_context_parallel_world_size()
++            if self.args.use_dynamic_batch_size
++            else None
++        )
++        vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
++        for teacher_tag in teacher_tags:
++            indices, micro_batches = _source_forward_schedule(
++                source_names,
++                rollout_data["total_lengths"],
++                _teacher_source(teacher_tag),
++                max_tokens,
++                self.args.micro_batch_size,
++            )
++            view = {
++                key: [rollout_data[key][i] for i in indices]
++                for key in self._FORWARD_KEYS
++                if rollout_data.get(key) is not None
++            }
++            iterators = [DataIterator(view, micro_batches) for _ in range(vpp_size)]
++            self._switch_model(teacher_tag)
++            out = self.compute_log_prob(iterators, [len(micro_batches)], store_prefix=f"{teacher_tag}_")
++            rollout_data.update({key: _scatter_rows(values, indices, len(source_names)) for key, values in out.items()})
++        _route_teacher_log_probs(rollout_data, teacher_tags)
++
+     def train(self, rollout_id: int, rollout_data_ref: Box, external_data=None):
+         if self.args.debug_rollout_only:
+             return None
+@@ -442,18 +611,8 @@ class MegatronTrainRayActor(TrainRayActor):
+                         )
+                     )
+ 
+-                # Forward teacher model to get teacher_log_probs for Megatron-based OPD
+-                if "teacher" in self.weights_backuper.backup_tags:
+-                    if self.args.use_routing_replay:
+-                        os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+-                    self._switch_model("teacher")
+-                    rollout_data.update(
+-                        self.compute_log_prob(
+-                            data_iterator,
+-                            num_microbatches,
+-                            store_prefix="teacher_",
+-                        )
+-                    )
++                # slime-opd-multi-teacher: the teacher forward(s), each teacher over its own source's samples.
++                self._forward_teachers(rollout_data, data_iterator, num_microbatches)
+ 
+                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
+                 can_reuse_log_probs_in_loss = (
+@@ -646,9 +805,11 @@ class MegatronTrainRayActor(TrainRayActor):
+         if model_tag == "ref" and self.args.ref_ckpt_step is not None:
+             old_ckpt_step = self.args.ckpt_step
+             self.args.ckpt_step = self.args.ref_ckpt_step
+-        elif model_tag == "teacher" and self.args.opd_teacher_ckpt_step is not None:
+-            old_ckpt_step = self.args.ckpt_step
+-            self.args.ckpt_step = self.args.opd_teacher_ckpt_step
++        elif model_tag in getattr(self.args, "opd_teacher_ckpt_step_map", {}):
++            teacher_ckpt_step = self.args.opd_teacher_ckpt_step_map[model_tag]
++            if teacher_ckpt_step is not None:
++                old_ckpt_step = self.args.ckpt_step
++                self.args.ckpt_step = teacher_ckpt_step
+ 
+         _, _ = load_checkpoint(
+             self.model,
+diff --git a/slime/utils/arguments.py b/slime/utils/arguments.py
+index b80990e..0cca050 100644
+--- a/slime/utils/arguments.py
++++ b/slime/utils/arguments.py
+@@ -1144,6 +1144,27 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
+             parser.add_argument(
+                 "--opd-teacher-ckpt-step", type=int, default=None, help="The checkpoint step for OPD teacher model."
+             )
++            parser.add_argument(
++                "--opd-teacher-loads",
++                type=str,
++                default=None,
++                help=(
++                    "JSON object mapping a sample's source name to that source's teacher checkpoint, "
++                    'e.g. \'{"retool": "/ckpt/math_grpo", "search-r1": "/ckpt/search_grpo"}\'. '
++                    "Use instead of --opd-teacher-load for a cross-domain run where each domain "
++                    "distils from its own teacher. Every sample's source -- "
++                    "Sample.metadata['source_name'], see slime.utils.data.get_source -- must be a key."
++                ),
++            )
++            parser.add_argument(
++                "--opd-teacher-ckpt-steps",
++                type=str,
++                default=None,
++                help=(
++                    "JSON object with the same keys as --opd-teacher-loads, mapping each to the "
++                    "iteration to distil from. Omit a key to take that teacher's latest iteration."
++                ),
++            )
+             return parser
+ 
+         # wandb
+@@ -1711,6 +1732,59 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
+     return eval_datasets
+ 
+ 
++def _parse_teacher_map(text: str, flag: str) -> dict:
++    """Parse a source->value map from a command line, in either spelling.
++
++    Two spellings, because one of them has to survive Ray's entrypoint. Ray
++    joins the entrypoint into a single string, and whether the quotes around a
++    JSON value are stripped before argparse sees it depends on that join: a run
++    reached argparse holding a value that still carried its outer single
++    quotes, which json.loads rejects at character 0 with a message that says
++    nothing about quoting.
++
++      retool=/ckpt/a,search-r1=/ckpt/b     no quotes, braces or spaces at all
++      {"retool": "/ckpt/a", ...}           JSON, for driving slime directly
++
++    Surrounding quotes are stripped before either is tried, so a value that
++    does arrive still wrapped is read rather than rejected. Errors quote the
++    raw value back, because the failure is almost always in the quoting.
++    """
++    raw = (text or "").strip()
++    for quote in ("'", '"'):
++        if len(raw) >= 2 and raw.startswith(quote) and raw.endswith(quote):
++            raw = raw[1:-1].strip()
++    if not raw:
++        raise ValueError(f"{flag} is empty. Received: {text!r}")
++
++    if raw.startswith("{"):
++        try:
++            parsed = json.loads(raw)
++        except json.JSONDecodeError as e:
++            raise ValueError(f"{flag} is not valid JSON ({e}). Received: {text!r}") from e
++        if not isinstance(parsed, dict) or not parsed:
++            raise ValueError(f"{flag} must be a non-empty JSON object. Received: {text!r}")
++        return parsed
++
++    parsed = {}
++    for item in raw.split(","):
++        item = item.strip()
++        if not item:
++            continue
++        if "=" not in item:
++            raise ValueError(
++                f"{flag} entry {item!r} has no '='. Expected source=value pairs separated by "
++                f"commas, e.g. retool=/ckpt/a,search-r1=/ckpt/b. Received: {text!r}"
++            )
++        name, _, value = item.partition("=")
++        name, value = name.strip(), value.strip()
++        if not name or not value:
++            raise ValueError(f"{flag} entry {item!r} has an empty side. Received: {text!r}")
++        parsed[name] = value
++    if not parsed:
++        raise ValueError(f"{flag} parsed to nothing. Received: {text!r}")
++    return parsed
++
++
+ def slime_validate_args(args):
+     args.eval_datasets = _resolve_eval_datasets(args)
+ 
+@@ -1724,37 +1798,79 @@ def slime_validate_args(args):
+                 "please make sure it is a valid megatron checkpoint directory."
+             )
+ 
+-    # Validate on-policy distillation (OPD) arguments
++    # Validate on-policy distillation (OPD) arguments.
++    #
++    # Normalizes both spellings -- the single --opd-teacher-load and the
++    # per-source --opd-teacher-loads -- into one pair of dicts keyed by weight
++    # tag, so that the actor has a single code path. The single-teacher tag stays
++    # "teacher" so that existing runs and checkpoints are unaffected.
++    args.opd_teacher_load_map = {}
++    args.opd_teacher_ckpt_step_map = {}
+     if args.use_opd:
+         if args.opd_type is None:
+             raise ValueError("--opd-type must be specified when --use-opd is enabled. Choose 'sglang' or 'megatron'.")
+ 
+         if args.opd_type == "megatron":
+-            if args.opd_teacher_load is None:
++            if args.opd_teacher_load is None and args.opd_teacher_loads is None:
+                 raise ValueError(
+-                    "--opd-teacher-load is required when --opd-type=megatron. "
++                    "--opd-teacher-load or --opd-teacher-loads is required when --opd-type=megatron. "
+                     "Please provide the path to the teacher model checkpoint."
+                 )
+-            if not os.path.exists(args.opd_teacher_load):
+-                raise FileNotFoundError(
+-                    f"opd_teacher_load {args.opd_teacher_load} does not exist, please check the path."
+-                )
+-            if not os.path.exists(os.path.join(args.opd_teacher_load, "latest_checkpointed_iteration.txt")):
+-                logger.info(
+-                    f"opd_teacher_load {args.opd_teacher_load} does not have latest_checkpointed_iteration.txt, "
+-                    "please make sure it is a valid megatron checkpoint directory."
++            if args.opd_teacher_load is not None and args.opd_teacher_loads is not None:
++                raise ValueError(
++                    "--opd-teacher-load and --opd-teacher-loads are alternatives; set exactly one. "
++                    "Use --opd-teacher-loads when each sample source distils from its own teacher."
+                 )
+ 
+-        elif args.opd_type == "sglang":
+             if args.opd_teacher_load is not None:
++                args.opd_teacher_load_map = {"teacher": args.opd_teacher_load}
++                args.opd_teacher_ckpt_step_map = {"teacher": args.opd_teacher_ckpt_step}
++            else:
++                loads = _parse_teacher_map(args.opd_teacher_loads, "--opd-teacher-loads")
++                steps = {}
++                if args.opd_teacher_ckpt_steps is not None:
++                    steps = {
++                        name: int(value)
++                        for name, value in _parse_teacher_map(
++                            args.opd_teacher_ckpt_steps, "--opd-teacher-ckpt-steps"
++                        ).items()
++                    }
++                    unknown = set(steps) - set(loads)
++                    if unknown:
++                        raise ValueError(
++                            f"--opd-teacher-ckpt-steps has keys with no teacher in --opd-teacher-loads: "
++                            f"{sorted(unknown)}"
++                        )
++                # "teacher::<source>", so that the actor can recover the source a
++                # tag belongs to and the tags stay distinguishable from "ref" /
++                # "actor" / "old_actor" by prefix alone.
++                args.opd_teacher_load_map = {f"teacher::{name}": path for name, path in sorted(loads.items())}
++                args.opd_teacher_ckpt_step_map = {
++                    f"teacher::{name}": steps.get(name) for name in sorted(loads)
++                }
++
++            for tag, path in args.opd_teacher_load_map.items():
++                if not os.path.exists(path):
++                    raise FileNotFoundError(f"{tag} checkpoint {path} does not exist, please check the path.")
++                if not os.path.exists(os.path.join(path, "latest_checkpointed_iteration.txt")):
++                    logger.info(
++                        f"{tag} checkpoint {path} does not have latest_checkpointed_iteration.txt, "
++                        "please make sure it is a valid megatron checkpoint directory."
++                    )
++
++        elif args.opd_type == "sglang":
++            if args.opd_teacher_load is not None or args.opd_teacher_loads is not None:
+                 raise ValueError(
+-                    "--opd-teacher-load should not be set when --opd-type=sglang. "
++                    "--opd-teacher-load / --opd-teacher-loads should not be set when --opd-type=sglang. "
+                     "In sglang mode, teacher log-probs are obtained from external server during rollout."
+                 )
+     else:
+-        # If OPD is not enabled, opd_teacher_load should not be set
+-        if args.opd_teacher_load is not None:
+-            raise ValueError("--opd-teacher-load is set but --use-opd is not enabled. Please add --use-opd flag.")
++        # If OPD is not enabled, no teacher checkpoint should be set
++        if args.opd_teacher_load is not None or args.opd_teacher_loads is not None:
++            raise ValueError(
++                "--opd-teacher-load / --opd-teacher-loads is set but --use-opd is not enabled. "
++                "Please add --use-opd flag."
++            )
+ 
+     load_is_megatron = (
+         args.load is not None

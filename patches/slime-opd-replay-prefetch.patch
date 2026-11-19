@@ -1,0 +1,69 @@
+opd: in a replay, read the next step's dump while this one trains.
+
+--load-debug-rollout-data (the replay arms: REPLAY_LOGS on grpo_multi.sh and
+opd_multi.sh) reads rollout_<k>.pt in the rollout manager when the driver asks
+for step k, unpickles 1536 samples' token and log-prob lists and builds the
+Sample objects, then converts and splits them for the trainer. The manager has
+nothing else to do in a replay (no engine to drive), and the trainer waits for
+it at every step: about 6 s of a 179 s step (perf/train_wait_time on the
+MOPeD run, 2026-11-07).
+
+So the manager starts reading step k + 1 in a thread as soon as it has handed
+out step k; the read overlaps the training of step k, and the next generate()
+takes the result. The convert and split of a step stay where they were. A step
+asked for out of order (a resume) is read then and there; the step past the
+last file is not started; a read that fails raises when its step is taken, as
+a synchronous read would. Nothing on the GPU side changes.
+
+Applied by opd_multi.sh when REPLAY_LOGS is set (marker
+slime-opd-replay-prefetch); independent of the other patches (rollout.py only).
+
+diff --git a/slime/ray/rollout.py b/slime/ray/rollout.py
+index 8ef7a0c..aafa9a8 100644
+--- a/slime/ray/rollout.py
++++ b/slime/ray/rollout.py
+@@ -1,3 +1,4 @@
++import concurrent.futures
+ import dataclasses
+ import itertools
+ import logging
+@@ -631,13 +632,34 @@ class RolloutManager:
+     def check_weights(self, action: str):
+         return ray.get([engine.check_weights.remote(action=action) for engine in self.rollout_engines])
+ 
++    # slime-opd-replay-prefetch: in a replay (--load-debug-rollout-data) the next step's dump is read
++    # and unpickled in a thread while the trainer works on this one. The manager is idle in between
++    # (no engine to drive), so the read leaves the step's critical path; the step past the end has
++    # no file and is not started; a read that fails surfaces when its step is taken, as a
++    # synchronous one would. A step taken out of order (a resume) is read then and there.
++    def _load_debug_rollout_samples(self, rollout_id):
++        path = self.args.load_debug_rollout_data.format(rollout_id=rollout_id)
++        return [Sample.from_dict(sample) for sample in torch.load(path, weights_only=False)["samples"]]
++
++    def _debug_rollout_samples(self, rollout_id):
++        prefetched = getattr(self, "_prefetched_debug_rollout", None)
++        self._prefetched_debug_rollout = None  # taken or dropped below, failed or not
++        if prefetched is not None and prefetched[0] == rollout_id:
++            data = prefetched[1].result()
++        else:
++            data = self._load_debug_rollout_samples(rollout_id)
++        next_id = rollout_id + 1
++        if next_id < self.args.num_rollout and os.path.exists(
++            self.args.load_debug_rollout_data.format(rollout_id=next_id)
++        ):
++            if getattr(self, "_debug_rollout_reader", None) is None:
++                self._debug_rollout_reader = concurrent.futures.ThreadPoolExecutor(max_workers=1)
++            self._prefetched_debug_rollout = (next_id, self._debug_rollout_reader.submit(self._load_debug_rollout_samples, next_id))
++        return data
++
+     def _get_rollout_data(self, rollout_id):
+         if self.args.load_debug_rollout_data:
+-            data = torch.load(
+-                self.args.load_debug_rollout_data.format(rollout_id=rollout_id),
+-                weights_only=False,
+-            )["samples"]
+-            data = [Sample.from_dict(sample) for sample in data]
++            data = self._debug_rollout_samples(rollout_id)
+             if (ratio := self.args.load_debug_rollout_data_subsample) is not None:
+                 original_num_rows = len(data)
+                 rough_subsample_num_rows = int(original_num_rows * ratio)

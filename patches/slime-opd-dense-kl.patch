@@ -1,0 +1,361 @@
+diff --git a/slime/backends/megatron_utils/actor.py b/slime/backends/megatron_utils/actor.py
+index e1ea98a..fc83bb1 100644
+--- a/slime/backends/megatron_utils/actor.py
++++ b/slime/backends/megatron_utils/actor.py
+@@ -1,5 +1,6 @@
+ import logging
+ import os
++from functools import partial
+ from argparse import Namespace
+ from contextlib import nullcontext
+ from datetime import timedelta
+@@ -118,23 +119,29 @@ def _route_teacher_log_probs(rollout_data: RolloutBatch, teacher_tags: list[str]
+         return
+ 
+     source_names = rollout_data["source_names"]
+-    by_source = {_teacher_source(tag): rollout_data[key] for tag, key in keys.items()}
+-    routed = []
+-    for index, source in enumerate(source_names):
+-        if source not in by_source:
+-            raise ValueError(
+-                f"Sample {index} has source {source!r}, which has no teacher in "
+-                f"--opd-teacher-loads (teachers: {sorted(by_source)}). Every source in the "
+-                "rollout needs one, otherwise that sample has no distillation target."
+-            )
+-        value = by_source[source][index]
+-        if value is None:
+-            raise ValueError(
+-                f"Sample {index} (source {source!r}) was not scored by its teacher: the per-source "
+-                "forward schedule (_source_forward_schedule) and the batch disagree."
+-            )
+-        routed.append(value)
+-    rollout_data["teacher_log_probs"] = routed
++    # slime-opd-dense-kl-fused: the same per-index choice for every output of the teacher forwards the
++    # loss reads -- the log-probs, and the top-k ids / log-probs of the dense term when it is on --
++    # each stored as teacher_<suffix>. Any other output (entropy) is dropped below, as before.
++    for suffix in ("log_probs", "topk_ids", "topk_log_probs"):
++        if not all(f"{tag}_{suffix}" in rollout_data for tag in teacher_tags):
++            continue
++        by_source = {_teacher_source(tag): rollout_data[f"{tag}_{suffix}"] for tag in teacher_tags}
++        routed = []
++        for index, source in enumerate(source_names):
++            if source not in by_source:
++                raise ValueError(
++                    f"Sample {index} has source {source!r}, which has no teacher in "
++                    f"--opd-teacher-loads (teachers: {sorted(by_source)}). Every source in the "
++                    "rollout needs one, otherwise that sample has no distillation target."
++                )
++            value = by_source[source][index]
++            if value is None:
++                raise ValueError(
++                    f"Sample {index} (source {source!r}) was not scored by its teacher: the per-source "
++                    "forward schedule (_source_forward_schedule) and the batch disagree."
++                )
++            routed.append(value)
++        rollout_data[f"teacher_{suffix}"] = routed
+ 
+     # The per-teacher lists are what each teacher thought of EVERY sample,
+     # including the ones it is not the teacher for. Keeping them would put
+@@ -460,10 +467,19 @@ class MegatronTrainRayActor(TrainRayActor):
+         num_microbatches: list[int],
+         store_prefix: str = "",
+     ) -> dict[str, list[torch.Tensor]]:
+-
++        # slime-opd-dense-kl-fused: a teacher forward ("teacher_" / "teacher::<source>_") under
++        # --opd-dense-kl stores the top-k ids and log-probs of every response position as well,
++        # {store_prefix}topk_ids / {store_prefix}topk_log_probs. Decided here, on the prefix, so that
++        # every caller of the teacher forward gets it (_forward_teachers, from train_actor)
++        # without touching the call sites. The student's own forward ("") is skipped
++        # when nothing reads it (_student_log_probs_consumed; since 2026-11-07).
++        if store_prefix == "" and not self._student_log_probs_consumed():
++            return {}
++        with_topk = self.args.opd_teacher_topk if getattr(self.args, "opd_dense_kl", None) and store_prefix.startswith("teacher") else 0
++        f = get_log_probs_and_entropy if not with_topk else partial(get_log_probs_and_entropy, with_topk=with_topk)
+         with timer(f"{store_prefix}log_probs"):
+             return forward_only(
+-                get_log_probs_and_entropy,
++                f,
+                 self.args,
+                 self.model,
+                 data_iterator,
+@@ -472,6 +488,29 @@ class MegatronTrainRayActor(TrainRayActor):
+                 use_rollout_top_p_replay=True,
+             )
+ 
++    def _student_log_probs_consumed(self) -> bool:
++        """Whether anything reads the student's standalone log-probs forward (rollout_data["log_probs"]).
++
++        slime-opd-dense-kl-fused: not under --opd-dense-kl with slime's sampled-token term at
++        --opd-kl-coef 0, the ratio to the rollout log-probs and no custom advantage function. The
++        dense term and train/train_rollout_logprob_abs_diff take the student's log-probs from the
++        training forward (loss.py), and the sampled-token term is 0 x its KL. loss.py then applies
++        no sampled-token term and stores no opd_reverse_kl, so train/teacher_kl-<source> is not
++        logged with the sampling policy's log-probs in the student's place (the dense arms' teacher
++        metric is train/teacher_dense_kl). The mismatch metrics, TIS and the correct-sample
++        entropy log read it, so they keep it.
++        """
++        args = self.args
++        return not (
++            getattr(args, "opd_dense_kl", None)
++            and args.opd_kl_coef == 0
++            and args.use_rollout_logprobs
++            and args.custom_advantage_function_path is None
++            and not args.get_mismatch_metrics
++            and not getattr(args, "use_tis", False)
++            and not getattr(args, "log_correct_samples", False)
++        )
++
+     # The per-sample keys forward_only's get_batch reads (model.py: tokens, loss masks, lengths,
+     # multimodal inputs, the rollout top-p replay's token sets); a teacher's view of the batch
+     # carries these alone.
+diff --git a/slime/backends/megatron_utils/data.py b/slime/backends/megatron_utils/data.py
+index 51b008d..f910dc7 100644
+--- a/slime/backends/megatron_utils/data.py
++++ b/slime/backends/megatron_utils/data.py
+@@ -291,6 +291,9 @@ def log_rollout_data(
+                 "num_microbatches",
+                 "micro_batch_indices",
+                 "source_names",
++                # slime-opd-dense-kl-fused: [L, k] ids and log-probs, not metrics
++                "teacher_topk_ids",
++                "teacher_topk_log_probs",
+             ]:
+                 continue
+             # Emit (sum, count) so gather_log_data can do a weighted average across
+diff --git a/slime/backends/megatron_utils/loss.py b/slime/backends/megatron_utils/loss.py
+index 4158130..63d7edc 100644
+--- a/slime/backends/megatron_utils/loss.py
++++ b/slime/backends/megatron_utils/loss.py
+@@ -478,9 +478,18 @@ def get_log_probs_and_entropy(
+     non_loss_data: bool = True,
+     top_p_token_ids: list[list[int]] | None = None,
+     top_p_token_offsets: list[list[int]] | None = None,
++    with_topk: int = 0,
++    topk_ids: list[torch.Tensor] | None = None,
+ ) -> dict[str, list[torch.Tensor]]:
+     """Compute per-token log-probabilities (and optionally entropy) on responses.
+ 
++    slime-opd-dense-kl-fused: with_topk > 0 also returns, per sample, the top-k ids (int32, global
++    vocabulary) and log-probs of every response position, "topk_ids" / "topk_log_probs" -- the
++    teacher side of the dense teacher term (train/src/teacher_dense_kl.py). topk_ids (per sample
++    [L_i, k], the teacher's ids) is the student side: the log-probs at those ids, "topk_log_probs"
++    (differentiable), out of the same function as the log-probs at the logged tokens, on the one
++    full-vocabulary buffer. Context parallel 1 only.
++
+     Computes on the **full** logits ``[T, V]`` tensor at once (instead of
+     per-sample slicing) so backward traverses ``[T, V]`` only once, then
+     extracts per-sample response portions.
+@@ -525,15 +534,30 @@ def get_log_probs_and_entropy(
+         )
+ 
+     # --- compute on full [T,V] logits at once via calculate_log_probs_and_entropy ---
+-    log_prob_full, entropy_full = calculate_log_probs_and_entropy(
+-        logits,
+-        full_tokens,
+-        tp_group,
+-        with_entropy=with_entropy,
+-        with_entropy_grad=with_entropy_grad,
+-        chunk_size=chunk_size,
+-        log_prob_keep_mask=top_p_keep_mask,
+-    )
++    if topk_ids is None:
++        log_prob_full, entropy_full = calculate_log_probs_and_entropy(
++            logits,
++            full_tokens,
++            tp_group,
++            with_entropy=with_entropy,
++            with_entropy_grad=with_entropy_grad,
++            chunk_size=chunk_size,
++            log_prob_keep_mask=top_p_keep_mask,
++        )
++    else:
++        # slime-opd-dense-kl-fused: the student side of the dense teacher term. The log-probs at the
++        # teacher's ids come out of the same autograd function as the log-prob at the logged token --
++        # slime's vocabulary-parallel log-prob function with the extra gather, one [T, V_local] buffer
++        # (train/src/teacher_dense_kl.py). Context parallel 1, no top-p replay.
++        assert not with_topk, "with_topk is the teacher side, topk_ids the student side; not both"
++        assert mpu.get_context_parallel_world_size() == 1 and not args.allgather_cp, "--opd-dense-kl needs context parallel 1"
++        assert top_p_keep_mask is None, "--opd-dense-kl is not implemented with rollout top-p replay"
++        from teacher_dense_kl import TPGroup, log_probs_and_topk, rows_to_full
++
++        ids_full = rows_to_full(topk_ids, total_lengths, response_lengths, T, dtype=torch.long)
++        log_prob_full, topk_full, entropy_full = log_probs_and_topk(
++            logits, full_tokens, ids_full, TPGroup(tp_group), with_entropy=with_entropy, with_entropy_grad=with_entropy_grad
++        )
+     log_prob_full = log_prob_full.squeeze(-1)  # [T, 1] -> [T]
+ 
+     # --- extract per-sample response portions ---
+@@ -549,6 +573,22 @@ def get_log_probs_and_entropy(
+     if with_entropy:
+         res["entropy"] = entropy_list
+ 
++    if with_topk:
++        # slime-opd-dense-kl-fused: the teacher side. The rows are _extract_per_sample's cp1 rows;
++        # logits is already temperature-scaled and [T, V_local] here.
++        assert mpu.get_context_parallel_world_size() == 1 and not args.allgather_cp, "--opd-dense-kl needs context parallel 1"
++        from teacher_dense_kl import TPGroup, response_rows, topk_log_probs
++
++        ids_full, lp_full = topk_log_probs(logits, with_topk, TPGroup(tp_group))
++        rows = response_rows(total_lengths, response_lengths)
++        res["topk_ids"] = [ids_full[a:b].clone() for a, b in rows]
++        res["topk_log_probs"] = [lp_full[a:b].clone() for a, b in rows]
++    if topk_ids is not None:
++        # slime-opd-dense-kl-fused: the student side, the log-probs at the teacher's ids per sample
++        from teacher_dense_kl import response_rows
++
++        res["topk_log_probs"] = [topk_full[a:b] for a, b in response_rows(total_lengths, response_lengths)]
++
+     # we need to turn the all gather kv into zigzag ring attn kv
+     if args.allgather_cp:
+         _allgather_cp_redistribute(
+@@ -764,7 +804,10 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch)
+         raise NotImplementedError(f"advantage_estimator {args.advantage_estimator} is not supported. ")
+ 
+     # Apply on-policy distillation KL penalty to advantages (orthogonal to advantage estimator)
+-    if args.use_opd:
++    # slime-opd-dense-kl-fused: not when the term is at 0 and the student's standalone forward was
++    # skipped (actor.py, _student_log_probs_consumed): the fallback below would be the sampling
++    # policy's log-probs, and the opd_reverse_kl stored from them would be logged as the student's.
++    if args.use_opd and (args.opd_kl_coef != 0 or "log_probs" in rollout_data):
+         apply_opd_kl_to_advantages(
+             args=args,
+             rollout_data=rollout_data,
+@@ -918,6 +961,14 @@ def policy_loss_function(
+     response_lengths = batch["response_lengths"]
+     total_lengths = batch["total_lengths"]
+ 
++    # slime-opd-dense-kl-fused: the dense teacher term's student side rides on the policy loss's own
++    # log-prob function (one full-vocabulary buffer, train/src/teacher_dense_kl.py); the teacher's
++    # top-k ids per sample come from its forward.
++    dense_kwargs = {}
++    if getattr(args, "opd_dense_kl", None):
++        if not batch.get("teacher_topk_ids"):
++            raise ValueError("--opd-dense-kl: the batch carries no teacher_topk_ids (the teacher forward did not store them)")
++        dense_kwargs = {"topk_ids": batch["teacher_topk_ids"]}
+     _, log_probs_and_entropy = get_log_probs_and_entropy(
+         logits,
+         args=args,
+@@ -926,6 +977,7 @@ def policy_loss_function(
+         response_lengths=response_lengths,
+         with_entropy=True,
+         **get_rollout_top_p_logprob_kwargs(args, batch),
++        **dense_kwargs,
+     )
+ 
+     log_probs = log_probs_and_entropy["log_probs"]
+@@ -1054,6 +1106,30 @@ def policy_loss_function(
+ 
+     loss = pg_loss - args.entropy_coef * entropy_loss
+ 
++    # slime-opd-dense-kl-fused: the dense teacher term, the KL between the student's and the
++    # teacher's (top-k + tail) next-token distributions at every response position, from the
++    # teacher's top-k stored by its forward and the student's log-probs at those ids computed
++    # above with the log-probs at the logged tokens (train/src/teacher_dense_kl.py).
++    # Differentiated directly: no ratio, no clip; the loss masks through sum_of_sample_mean as
++    # for every other term.
++    dense = None
++    if dense_kwargs:
++        from teacher_dense_kl import dense_kl_for_batch
++
++        dense = dense_kl_for_batch(
++            log_probs_and_entropy["topk_log_probs"],
++            batch["teacher_topk_ids"],
++            batch["teacher_topk_log_probs"],
++            args.opd_dense_kl,
++            tokens=batch["unconcat_tokens"],
++            total_lengths=total_lengths,
++            response_lengths=response_lengths,
++            student_log_probs=log_probs_and_entropy["log_probs"],
++            teacher_log_probs=batch["teacher_log_probs"],
++        )
++        dense_kl_loss = sum_of_sample_mean(dense["kl"])
++        loss = loss + args.opd_dense_kl_coef * dense_kl_loss
++
+     if args.use_kl_loss:
+         ref_log_probs = batch["ref_log_probs"]
+         ref_log_probs = torch.cat(ref_log_probs, dim=0)
+@@ -1106,6 +1182,16 @@ def policy_loss_function(
+     if args.use_opsm:
+         reported_loss["opsm_clipfrac"] = opsm_clipfrac
+ 
++    if dense is not None:
++        # slime-opd-dense-kl-fused: the term before its coefficient; the share of logged tokens
++        # inside the teacher's top-k; and the two agreement checks at the logged token -- the
++        # student's gather against the same function's log-prob at that token (0 up to rounding),
++        # the teacher's top-k against slime's own log-softmax there (~1e-5 when the TP paths are right).
++        reported_loss["teacher_dense_kl"] = dense_kl_loss.clone().detach()
++        reported_loss["teacher_topk_hit"] = sum_of_sample_mean(dense["hit"]).clone().detach()
++        reported_loss["teacher_dense_err_student"] = sum_of_sample_mean(dense["err_student"]).clone().detach()
++        reported_loss["teacher_dense_err_teacher"] = sum_of_sample_mean(dense["err_teacher"]).clone().detach()
++
+     # Add OPD metrics if available
+     if "opd_reverse_kl" in batch:
+         opd_reverse_kl = torch.cat(batch["opd_reverse_kl"], dim=0)
+diff --git a/slime/backends/megatron_utils/model.py b/slime/backends/megatron_utils/model.py
+index 1ad6cd7..5e0705b 100644
+--- a/slime/backends/megatron_utils/model.py
++++ b/slime/backends/megatron_utils/model.py
+@@ -592,6 +592,9 @@ def train_one_step(
+                     "returns",
+                     "rollout_log_probs",
+                     "teacher_log_probs",
++                    # slime-opd-dense-kl-fused: the teacher's top-k per sample, when --opd-dense-kl is on
++                    "teacher_topk_ids",
++                    "teacher_topk_log_probs",
+                     "rollout_mask_sums",
+                 ],
+             ),
+diff --git a/slime/utils/arguments.py b/slime/utils/arguments.py
+index 0cca050..a48eb5b 100644
+--- a/slime/utils/arguments.py
++++ b/slime/utils/arguments.py
+@@ -1165,6 +1165,30 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
+                     "iteration to distil from. Omit a key to take that teacher's latest iteration."
+                 ),
+             )
++            # slime-opd-dense-kl-fused: the teacher term on the teacher's whole next-token distribution
++            # (its top-k plus a tail atom) at every position, instead of at the sampled token.
++            # train/src/teacher_dense_kl.py; the top-k is taken in the teachers' forward (actor.py),
++            # the term is computed and differentiated in the policy loss (loss.py).
++            parser.add_argument(
++                "--opd-dense-kl",
++                type=str,
++                choices=["reverse", "forward", "js"],
++                default=None,
++                help=(
++                    "The dense teacher term: the KL between the student's and the teacher's next-token "
++                    "distributions at every response position, on the teacher's top-k (--opd-teacher-topk) "
++                    "plus one tail atom, differentiated directly in the loss (no importance ratio, no clip). "
++                    "'reverse' is KL(student || teacher), the quantity the sampled-token term of "
++                    "--opd-kl-coef estimates; 'forward' is KL(teacher || student); 'js' is Jensen-Shannon. "
++                    "Needs --opd-type megatron and context parallel 1."
++                ),
++            )
++            parser.add_argument(
++                "--opd-dense-kl-coef", type=float, default=1.0, help="Weight of the dense teacher term in the loss."
++            )
++            parser.add_argument(
++                "--opd-teacher-topk", type=int, default=256, help="Teacher atoms kept per position for --opd-dense-kl."
++            )
+             return parser
+ 
+         # wandb
+@@ -1872,6 +1896,18 @@ def slime_validate_args(args):
+                 "Please add --use-opd flag."
+             )
+ 
++    # slime-opd-dense-kl-fused
++    if getattr(args, "opd_dense_kl", None):
++        if not args.use_opd or args.opd_type != "megatron":
++            raise ValueError(
++                "--opd-dense-kl needs --use-opd with --opd-type megatron: the teacher's top-k is taken in "
++                "the trainer's own teacher forward."
++            )
++        if getattr(args, "context_parallel_size", 1) != 1 or getattr(args, "allgather_cp", False):
++            raise ValueError("--opd-dense-kl is implemented for context parallel 1 only.")
++        if args.opd_teacher_topk < 1:
++            raise ValueError(f"--opd-teacher-topk must be >= 1, got {args.opd_teacher_topk}")
++
+     load_is_megatron = (
+         args.load is not None
+         and os.path.exists(args.load)
